@@ -1,0 +1,6 @@
+{
+  "name": "CakeWise",
+  "description": "A professional pricing engine and ingredient cost estimator for Nigerian bespoke bakers.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
