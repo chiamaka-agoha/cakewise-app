@@ -65,6 +65,72 @@ export function calculateCakePrice(inputs: CakeInputs): CalculationResult {
     layerFlavors,
   } = inputs;
 
+  const isEmpty = !useCustomTiers
+    ? (cakeSize === '' || cakeSize === 0 || numberOfLayers === '' || numberOfLayers === 0 || numberOfTiers === '' || numberOfTiers === 0)
+    : (numberOfTiers === '' || numberOfTiers === 0 || !customTiers || customTiers.length === 0 || customTiers.some(t => t.size === '' || t.size === 0 || t.layers === '' || t.layers === 0));
+
+  if (isEmpty) {
+    return {
+      sizeMultiplier: 0,
+      ingredientQuantities: {
+        flour: 0,
+        sugar: 0,
+        margarine: 0,
+        eggs: 0,
+        cocoa: 0,
+        milk: 0,
+        oil: 0,
+        bakingPowder: 0,
+        flavouring: 0,
+        icingSugar: 0,
+        buttercreamMargarine: 0,
+        mixedFruits: 0,
+        whippingCreamPowder: 0,
+        chocolateSlabs: 0,
+        liquidCream: 0,
+        fondant: 0,
+      },
+      breakdown: {
+        ingredients: {
+          flourCost: 0,
+          sugarCost: 0,
+          margarineCost: 0,
+          eggsCost: 0,
+          cocoaCost: 0,
+          milkCost: 0,
+          oilCost: 0,
+          bakingPowderCost: 0,
+          flavouringCost: 0,
+          icingSugarCost: 0,
+          buttercreamMargarineCost: 0,
+          whippingCreamPowderCost: 0,
+          chocolateSlabsCost: 0,
+          liquidCreamCost: 0,
+          fondantCost: 0,
+          mixedFruitsCost: 0,
+          total: 0,
+        },
+        labour: 0,
+        overhead: 0,
+        packaging: 0,
+        delivery: 0,
+        complexityExtra: 0,
+      },
+      totalCost: 0,
+      budget: { minPrice: 0, maxPrice: 0, profitMin: 0, profitMax: 0, marginMin: 0, marginMax: 0, isCorrected: false },
+      standard: { minPrice: 0, maxPrice: 0, profitMin: 0, profitMax: 0, marginMin: 0, marginMax: 0, isCorrected: false },
+      premium: { minPrice: 0, maxPrice: 0, profitMin: 0, profitMax: 0, marginMin: 0, marginMax: 0, isCorrected: false },
+      suggestedSellingPrice: 0,
+      suggestedMinPrice: 0,
+      suggestedMaxPrice: 0,
+      expectedMin: 0,
+      expectedMax: 0,
+      estimatedProfit: 0,
+      isAnchorCorrected: false,
+      originalUnanchoredPrice: 0,
+    };
+  }
+
   const parsedCakeSize = typeof cakeSize === 'number' ? cakeSize : 0;
   const parsedNumberOfTiers = typeof numberOfTiers === 'number' ? numberOfTiers : 0;
   const parsedNumberOfLayers = typeof numberOfLayers === 'number' ? numberOfLayers : 0;

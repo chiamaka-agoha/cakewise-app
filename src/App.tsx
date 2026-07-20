@@ -39,10 +39,139 @@ import {
   LogOut
 } from 'lucide-react';
 import { CakeInputs, CakeType, ComplexityLevel, FrostingType, SavedCalculation, INGREDIENT_UNIT_COSTS, BASE_RECIPES } from './types';
-import { calculateCakePrice } from './utils/calculator';
+import { calculateCakePrice as runPriceCalculation } from './utils/calculator';
 import { motion, AnimatePresence } from 'motion/react';
 
 const LOCAL_STORAGE_KEY = 'cake_calculator_calculations_v1';
+
+// --- Subscription Plan Types and Helpers ---
+interface SubscriptionState {
+  planType: 'free' | 'weekly' | 'monthly' | 'premium';
+  startDate: string | null;
+  endDate: string | null;
+  selectedDays: string[];
+  daysUsed: string[];
+  scanCountToday: number;
+  lastResetDate: string;
+  freeTotalScansUsed: number;
+}
+
+const getCurrentLocalDateString = () => {
+  const d = new Date();
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
+
+const runSubChecks = (sub: SubscriptionState): SubscriptionState => {
+  const updated = { ...sub };
+  const todayStr = getCurrentLocalDateString();
+  
+  // 1. Midnight reset
+  if (updated.lastResetDate !== todayStr) {
+    updated.scanCountToday = 0;
+    updated.lastResetDate = todayStr;
+  }
+
+  // 2. Global expiry check
+  if (updated.planType !== 'free' && updated.endDate) {
+    if (Date.now() > new Date(updated.endDate).getTime()) {
+      updated.planType = 'free';
+      updated.startDate = null;
+      updated.endDate = null;
+      updated.selectedDays = [];
+      updated.daysUsed = [];
+      updated.scanCountToday = 0;
+    }
+  }
+
+  // 3. Weekly plan specific end condition (if 3 days used -> expire)
+  if (updated.planType === 'weekly' && updated.daysUsed && updated.daysUsed.length >= 3) {
+    updated.planType = 'free';
+    updated.startDate = null;
+    updated.endDate = null;
+    updated.selectedDays = [];
+    updated.daysUsed = [];
+    updated.scanCountToday = 0;
+  }
+
+  return updated;
+};
+
+const getScansLeftToday = (sub: SubscriptionState) => {
+  const checked = runSubChecks(sub);
+  if (checked.planType === 'premium') {
+    return Infinity; // Unlimited
+  }
+  if (checked.planType === 'weekly') {
+    const daysOfWeek = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+    const currentDayName = daysOfWeek[new Date().getDay()];
+    if (!checked.selectedDays.includes(currentDayName)) {
+      return 0;
+    }
+    return Math.max(0, 5 - checked.scanCountToday);
+  }
+  if (checked.planType === 'monthly') {
+    return Math.max(0, 5 - checked.scanCountToday);
+  }
+  // Free plan
+  if (checked.freeTotalScansUsed < 3) {
+    return Math.max(0, 3 - checked.freeTotalScansUsed);
+  }
+  return Math.max(0, 2 - checked.scanCountToday);
+};
+
+const checkScanPermission = (sub: SubscriptionState) => {
+  const checked = runSubChecks(sub);
+  const todayStr = getCurrentLocalDateString();
+  
+  if (checked.planType === 'premium') {
+    return { allowed: true, reason: '', sub: checked };
+  }
+  
+  if (checked.planType === 'weekly') {
+    const daysOfWeek = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+    const currentDayName = daysOfWeek[new Date().getDay()];
+    
+    if (checked.selectedDays.length < 3) {
+      return { allowed: false, reason: '⚠️ Please select exactly 3 days of the week to use your Weekly Plan on your Dashboard before scanning.', sub: checked, selectDaysNeeded: true };
+    }
+    
+    if (!checked.selectedDays.includes(currentDayName)) {
+      return { allowed: false, reason: `⚠️ Today (${currentDayName}) is not one of your selected Weekly Plan days. Please select today if you wish to use a day budget, or upgrade plans.`, sub: checked };
+    }
+    
+    const isNewDayUsed = !checked.daysUsed.includes(todayStr);
+    if (isNewDayUsed && checked.daysUsed.length >= 3) {
+      return { allowed: false, reason: '⚠️ You have already scanned on 3 different days under this Weekly Plan. The plan has expired.', sub: checked };
+    }
+    
+    if (checked.scanCountToday >= 5) {
+      return { allowed: false, reason: '⚠️ You have reached the limit of 5 scans for today.', sub: checked };
+    }
+    
+    return { allowed: true, reason: '', sub: checked };
+  }
+  
+  if (checked.planType === 'monthly') {
+    if (checked.scanCountToday >= 5) {
+      return { allowed: false, reason: '⚠️ You have reached your limit of 5 scans for today.', sub: checked };
+    }
+    return { allowed: true, reason: '', sub: checked };
+  }
+  
+  // Free Plan
+  if (checked.freeTotalScansUsed < 3) {
+    return { allowed: true, reason: '', sub: checked };
+  }
+  
+  if (checked.scanCountToday >= 2) {
+    return { allowed: false, reason: '⚠️ You have used your 2 free scans for today. Upgrade to CakeWise Pro to unlock more scans!', sub: checked };
+  }
+  
+  return { allowed: true, reason: '', sub: checked };
+};
 
 // --- Helpers for AI Cake Vision Report ---
 const getFormattedSizesString = (sizes: number[]) => {
@@ -73,6 +202,34 @@ const getFormattedLayersString = (layers: number[]) => {
     if (i === layers.length - 1) return `${l} layers top`;
     return `${l} layers middle`;
   }).reverse().join(', ');
+};
+
+const getMissingFields = (inputs: CakeInputs): string[] => {
+  const missing: string[] = [];
+  if (inputs.useCustomTiers) {
+    if (!inputs.numberOfTiers || inputs.numberOfTiers === 0) {
+      missing.push("Number of Tiers");
+    }
+    if (!inputs.customTiers || inputs.customTiers.length === 0) {
+      missing.push("Tiers Configuration");
+    } else {
+      const incompleteTiers = inputs.customTiers.some(t => !t.size || !t.layers);
+      if (incompleteTiers) {
+        missing.push("Tier Dimensions");
+      }
+    }
+  } else {
+    if (inputs.cakeSize === '' || inputs.cakeSize === 0) {
+      missing.push("Cake Size");
+    }
+    if (inputs.numberOfLayers === '' || inputs.numberOfLayers === 0) {
+      missing.push("Number of Layers");
+    }
+    if (inputs.numberOfTiers === '' || inputs.numberOfTiers === 0) {
+      missing.push("Number of Tiers");
+    }
+  }
+  return missing;
 };
 
 const getFormattedDesignString = (frosting: string, elements: string[], complexity: string) => {
@@ -134,7 +291,15 @@ export default function App() {
 
   const [sessionStarted, setSessionStarted] = useState<boolean>(() => {
     try {
-      return localStorage.getItem('cakewise_session_started') === 'true';
+      localStorage.removeItem('cakewise_session_started');
+      localStorage.removeItem('cakewise_subscription');
+      localStorage.removeItem('cakewise_scans_left');
+      localStorage.removeItem('cakewise_is_premium');
+      localStorage.removeItem('cakewise_baker_name');
+      localStorage.removeItem('cakewise_baker_email');
+      localStorage.removeItem(LOCAL_STORAGE_KEY);
+      localStorage.removeItem('cakewise_active_inputs');
+      return false;
     } catch {
       return false;
     }
@@ -170,22 +335,76 @@ export default function App() {
   const [loadedSuccess, setLoadedSuccess] = useState<string>('');
   const [manualPriceOverride, setManualPriceOverride] = useState<string>('');
 
-  // --- Premium Upgrade & Scan Limit States ---
-  const [isPremiumUser, setIsPremiumUser] = useState<boolean>(() => {
+  // --- Subscription Plan State & Derivations ---
+  const [subscription, setSubscription] = useState<SubscriptionState>(() => {
     try {
-      return localStorage.getItem('cakewise_is_premium') === 'true';
-    } catch {
-      return false;
+      const stored = localStorage.getItem('cakewise_subscription');
+      if (stored) {
+        return runSubChecks(JSON.parse(stored));
+      }
+    } catch (e) {
+      console.error('Error loading subscription', e);
     }
+    // Default Free subscription
+    return {
+      planType: 'free',
+      startDate: null,
+      endDate: null,
+      selectedDays: [],
+      daysUsed: [],
+      scanCountToday: 0,
+      lastResetDate: getCurrentLocalDateString(),
+      freeTotalScansUsed: 0
+    };
   });
-  const [dailyScansLeft, setDailyScansLeft] = useState<number>(() => {
+
+  // Run validation on load / render to keep everything in sync
+  useEffect(() => {
+    setSubscription(prev => {
+      const checked = runSubChecks(prev);
+      if (JSON.stringify(checked) !== JSON.stringify(prev)) {
+        return checked;
+      }
+      return prev;
+    });
+  }, []);
+
+  // Sync to localStorage
+  useEffect(() => {
     try {
-      const stored = localStorage.getItem('cakewise_scans_left');
-      return stored !== null ? parseInt(stored, 10) : 3;
-    } catch {
-      return 3;
+      localStorage.setItem('cakewise_subscription', JSON.stringify(subscription));
+      // Keep legacy keys in sync for older code compatibility
+      localStorage.setItem('cakewise_is_premium', (subscription.planType !== 'free').toString());
+      localStorage.setItem('cakewise_scans_left', getScansLeftToday(subscription).toString());
+    } catch (e) {
+      console.error('Error syncing subscription to localStorage', e);
     }
-  });
+  }, [subscription]);
+
+  // Derived compatible properties
+  const isPremiumUser = subscription.planType !== 'free';
+  const dailyScansLeft = getScansLeftToday(subscription);
+
+  const recordScanSuccessful = () => {
+    setSubscription(prev => {
+      const checked = runSubChecks(prev);
+      const todayStr = getCurrentLocalDateString();
+      const updated = { ...checked };
+      
+      updated.scanCountToday += 1;
+      
+      if (updated.planType === 'free') {
+        updated.freeTotalScansUsed += 1;
+      } else if (updated.planType === 'weekly') {
+        if (!updated.daysUsed.includes(todayStr)) {
+          updated.daysUsed = [...updated.daysUsed, todayStr];
+        }
+      }
+      
+      return runSubChecks(updated);
+    });
+  };
+
   const [showPricingModal, setShowPricingModal] = useState<boolean>(false);
   const [selectedPlanTab, setSelectedPlanTab] = useState<'free' | 'weekly' | 'monthly'>('monthly');
   const [paymentPlanToCheckout, setPaymentPlanToCheckout] = useState<'standard_weekly' | 'standard_monthly' | 'premium_weekly' | 'premium_monthly' | null>(null);
@@ -261,8 +480,25 @@ export default function App() {
           ]
         },
         callback: function(response: any) {
-          setIsPremiumUser(true);
-          setDailyScansLeft(99999);
+          const isWeekly = plan.endsWith('weekly');
+          const isPremium = plan.startsWith('premium');
+          const planType = isWeekly ? 'weekly' : (isPremium ? 'premium' : 'monthly');
+          
+          const startDate = new Date().toISOString();
+          const durationDays = isWeekly ? 7 : 30;
+          const endDate = new Date(Date.now() + durationDays * 24 * 60 * 60 * 1000).toISOString();
+          
+          setSubscription({
+            planType,
+            startDate,
+            endDate,
+            selectedDays: [],
+            daysUsed: [],
+            scanCountToday: 0,
+            lastResetDate: getCurrentLocalDateString(),
+            freeTotalScansUsed: subscription.freeTotalScansUsed
+          });
+
           setPaymentPlanToCheckout(null);
           setPaymentFeedback({
             text: 'Payment successful! Your plan is now active.',
@@ -287,22 +523,6 @@ export default function App() {
       });
     }
   };
-
-  useEffect(() => {
-    try {
-      localStorage.setItem('cakewise_is_premium', isPremiumUser.toString());
-    } catch (e) {
-      console.error('Error saving premium status', e);
-    }
-  }, [isPremiumUser]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem('cakewise_scans_left', dailyScansLeft.toString());
-    } catch (e) {
-      console.error('Error saving scan limit', e);
-    }
-  }, [dailyScansLeft]);
 
   // --- Cost breakdown accordion toggles ---
   const [showDetailedIngredients, setShowDetailedIngredients] = useState<boolean>(false);
@@ -336,9 +556,10 @@ export default function App() {
   const analyzeCakeImage = async () => {
     if (!inputs.referenceImage) return;
     
-    // Check daily scan limits for non-premium accounts
-    if (!isPremiumUser && dailyScansLeft <= 0) {
-      setAnalysisError("⚠️ Look like you have used all your complimentary scans for today. See upgraded plans below to get unlimited AI scanning!");
+    // Check scan permission from the robust subscription system
+    const perm = checkScanPermission(subscription);
+    if (!perm.allowed) {
+      setAnalysisError(perm.reason);
       setShowPricingModal(true);
       return;
     }
@@ -384,10 +605,8 @@ export default function App() {
       const result = await response.json();
       setAnalysisResult(result);
 
-      // Decrement scan token if successful and not premium
-      if (!isPremiumUser) {
-        setDailyScansLeft(prev => Math.max(0, prev - 1));
-      }
+      // Record successful scan in our subscription tracker
+      recordScanSuccessful();
 
       // Automatically adjust form values based on AI's vision metrics
       const isCakeDetected = result.isCakeDetected;
@@ -531,6 +750,7 @@ export default function App() {
       localStorage.removeItem('cakewise_is_premium');
       localStorage.removeItem('cakewise_scans_left');
       localStorage.removeItem('cakewise_active_inputs');
+      localStorage.removeItem('cakewise_subscription');
     } catch (e) {
       console.error(e);
     }
@@ -538,8 +758,16 @@ export default function App() {
     setBakerName('');
     setBakerEmail('');
     setSessionStarted(false);
-    setIsPremiumUser(false);
-    setDailyScansLeft(3);
+    setSubscription({
+      planType: 'free',
+      startDate: null,
+      endDate: null,
+      selectedDays: [],
+      daysUsed: [],
+      scanCountToday: 0,
+      lastResetDate: getCurrentLocalDateString(),
+      freeTotalScansUsed: 0
+    });
     setHistory([]);
     handleReset();
   };
@@ -559,7 +787,7 @@ export default function App() {
     ? (inputs.cakeSize === '' || inputs.cakeSize === 0 || inputs.numberOfLayers === '' || inputs.numberOfLayers === 0 || inputs.numberOfTiers === '' || inputs.numberOfTiers === 0)
     : (inputs.numberOfTiers === '' || inputs.numberOfTiers === 0 || !inputs.customTiers || inputs.customTiers.length === 0 || inputs.customTiers.some(t => t.size === '' || t.size === 0 || t.layers === '' || t.layers === 0));
 
-  const results = calculateCakePrice(inputs);
+  const results = runPriceCalculation(inputs);
 
   // --- Derivations for manual price override ---
   const parsedOverride = parseFloat(manualPriceOverride);
@@ -702,6 +930,15 @@ export default function App() {
     }));
   };
 
+  const calculateCakePrice = () => {
+    if (isEmpty) {
+      applyStandardEstimate();
+    } else {
+      // Force calculation update
+      setInputs(prev => ({ ...prev }));
+    }
+  };
+
   const applyPresetMargin = (margin: number) => {
     setInputs(prev => ({ ...prev, profitMargin: margin }));
   };
@@ -813,7 +1050,7 @@ export default function App() {
   const handleLoadCalculation = (item: SavedCalculation) => {
     setInputs({ ...item.inputs });
     // If the saved suggested retail price differs from what standard calculation outputs, restore override
-    const calculatedTemp = calculateCakePrice(item.inputs);
+    const calculatedTemp = runPriceCalculation(item.inputs);
     if (item.result.suggestedSellingPrice !== calculatedTemp.suggestedSellingPrice) {
       setManualPriceOverride(item.result.suggestedSellingPrice.toString());
     } else {
@@ -1179,22 +1416,90 @@ export default function App() {
             </div>
             
             {/* Active Plan Card */}
-            <div className="bg-gradient-to-r from-[#FFE6F0] to-[#FFF7F5] border border-pink-150 p-4 rounded-2xl flex items-center justify-between gap-6 shrink-0 md:min-w-[320px] text-left">
-              <div>
-                <div className="flex items-center gap-1.5">
-                  <span className="text-[10px] uppercase font-black tracking-widest text-[#FF6FA7]">Current Plan</span>
-                  <span className="bg-[#28C76F] text-white text-[9px] font-extrabold px-2 py-0.5 rounded-full uppercase tracking-wider">Active</span>
+            <div className="bg-gradient-to-r from-[#FFE6F0] to-[#FFF7F5] border border-pink-150 p-4 rounded-2xl flex flex-col gap-3 shrink-0 md:min-w-[340px] text-left">
+              <div className="flex items-center justify-between gap-6">
+                <div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[10px] uppercase font-black tracking-widest text-[#FF6FA7]">Current Plan</span>
+                    <span className="bg-[#28C76F] text-white text-[9px] font-extrabold px-2 py-0.5 rounded-full uppercase tracking-wider">Active</span>
+                  </div>
+                  <h4 className="text-base font-black text-[#6B1E57] mt-1">
+                    {subscription.planType === 'free' && "Free Sandbox"}
+                    {subscription.planType === 'weekly' && "Weekly Standard"}
+                    {subscription.planType === 'monthly' && "Monthly Standard"}
+                    {subscription.planType === 'premium' && "CakeWise Premium"}
+                  </h4>
+                  <p className="text-[10.5px] text-slate-500 font-semibold leading-normal">
+                    {subscription.planType === 'free' ? (
+                      "Never expires • 2 scans/day"
+                    ) : (
+                      <>
+                        Expires in {Math.max(1, Math.ceil((new Date(subscription.endDate!).getTime() - Date.now()) / (1000 * 60 * 60 * 24)))} days
+                      </>
+                    )}
+                  </p>
+                  <p className="text-[10px] text-indigo-700 font-extrabold mt-0.5">
+                    {subscription.planType === 'weekly' && `Weekly: ${subscription.daysUsed.length} of 3 days used`}
+                    {subscription.planType !== 'weekly' && `Scans left today: ${dailyScansLeft === Infinity ? "Unlimited" : dailyScansLeft}`}
+                  </p>
                 </div>
-                <h4 className="text-base font-black text-[#6B1E57] mt-1">{isPremiumUser ? "CakeWise Premium" : "Free Sandbox"}</h4>
-                <p className="text-[10.5px] text-slate-400 font-medium">Renews on {new Date(new Date().getFullYear(), new Date().getMonth() + 1, 28).toLocaleDateString('en-US', { day: 'numeric', month: 'short', year: 'numeric' })}</p>
+                <button
+                  type="button"
+                  onClick={() => setShowPricingModal(true)}
+                  className="bg-white hover:bg-pink-50 text-[#FF6FA7] border border-pink-200 text-xs font-bold py-2 px-3.5 rounded-xl transition-all shadow-2xs cursor-pointer active:scale-95"
+                >
+                  View Plans
+                </button>
               </div>
-              <button
-                type="button"
-                onClick={() => setShowPricingModal(true)}
-                className="bg-white hover:bg-pink-50 text-[#FF6FA7] border border-pink-200 text-xs font-bold py-2 px-3.5 rounded-xl transition-all shadow-2xs cursor-pointer active:scale-95"
-              >
-                View Plans
-              </button>
+
+              {/* Weekly Day Selection Widget */}
+              {subscription.planType === 'weekly' && (
+                <div className="mt-1 p-2.5 bg-white/70 rounded-xl border border-pink-200/40 text-[10.5px] text-slate-700 space-y-1.5 animate-fade-in">
+                  <p className="font-extrabold text-[#6B1E57] flex items-center gap-1">
+                    📅 Select exactly 3 Weekly Scan Days:
+                  </p>
+                  <div className="grid grid-cols-7 gap-1">
+                    {["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"].map(day => {
+                      const isSelected = subscription.selectedDays.includes(day);
+                      return (
+                        <button
+                          key={day}
+                          type="button"
+                          onClick={() => {
+                            setSubscription(prev => {
+                              let updatedDays = [...prev.selectedDays];
+                              if (updatedDays.includes(day)) {
+                                updatedDays = updatedDays.filter(d => d !== day);
+                              } else if (updatedDays.length < 3) {
+                                updatedDays.push(day);
+                              }
+                              return { ...prev, selectedDays: updatedDays };
+                            });
+                          }}
+                          disabled={!isSelected && subscription.selectedDays.length >= 3}
+                          className={`py-1 text-[9px] font-bold rounded-md transition-all ${
+                            isSelected
+                              ? 'bg-[#FF6FA7] text-white shadow-2xs'
+                              : 'bg-slate-50 border border-slate-200 text-slate-500 hover:bg-slate-100 disabled:opacity-50 disabled:hover:bg-slate-50'
+                          }`}
+                        >
+                          {day.slice(0, 3)}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <div className="flex justify-between items-center text-[9px] text-slate-500">
+                    <span>
+                      {subscription.selectedDays.length === 3 
+                        ? `Selected: ${subscription.selectedDays.map(d => d.slice(0, 3)).join(', ')}`
+                        : `${subscription.selectedDays.length}/3 selected`}
+                    </span>
+                    <span className="font-bold text-[#FF6FA7]">
+                      Scans left today: {dailyScansLeft}
+                    </span>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
 
@@ -2146,9 +2451,17 @@ export default function App() {
                   
                   {/* Free vs Pro indicator */}
                   <div className="flex items-center gap-1.5 text-[10.5px]">
-                    {isPremiumUser ? (
+                    {subscription.planType === 'premium' ? (
                       <span className="bg-violet-100 text-violet-800 font-extrabold uppercase tracking-wider px-2 py-0.5 rounded-full border border-violet-200 flex items-center gap-1 shadow-2xs">
-                        <Crown className="w-3 h-3 text-violet-705 animate-pulse" /> Pro Member (Unlimited)
+                        <Crown className="w-3 h-3 text-violet-700 animate-pulse" /> Premium (Unlimited)
+                      </span>
+                    ) : subscription.planType === 'weekly' ? (
+                      <span className="bg-pink-100 text-pink-800 font-extrabold uppercase tracking-wider px-2 py-0.5 rounded-full border border-pink-200 flex items-center gap-1 shadow-2xs">
+                        📅 Weekly ({dailyScansLeft}/5 today)
+                      </span>
+                    ) : subscription.planType === 'monthly' ? (
+                      <span className="bg-indigo-100 text-indigo-800 font-extrabold uppercase tracking-wider px-2 py-0.5 rounded-full border border-indigo-200 flex items-center gap-1 shadow-2xs">
+                        📆 Monthly ({dailyScansLeft}/5 today)
                       </span>
                     ) : (
                       <span className={`font-semibold px-2 py-0.5 rounded-full border flex items-center gap-1 ${
@@ -2156,14 +2469,14 @@ export default function App() {
                           ? 'bg-slate-100 text-slate-700 border-slate-200' 
                           : 'bg-red-50 text-red-700 border-red-200 animate-pulse'
                       }`}>
-                        Scans remaining: <b>{dailyScansLeft}/3 today</b>
+                        Free Scans: <b>{dailyScansLeft} left today</b>
                       </span>
                     )}
                     
                     <button
                       type="button"
                       onClick={() => setShowPricingModal(true)}
-                      className="text-indigo-600 hover:text-indigo-800 font-bold hover:underline"
+                      className="text-[#FF6FA7] hover:text-[#FF4A8B] font-bold hover:underline"
                     >
                       {isPremiumUser ? "Plans" : "👑 Upgrade"}
                     </button>
@@ -2171,44 +2484,92 @@ export default function App() {
                 </div>
 
                 {/* Simulation Control Bar for Review */}
-                <div className="bg-slate-100/70 border border-slate-200/60 rounded-lg p-1.5 px-2.5 flex items-center justify-between text-[10px] text-slate-500 gap-2 mb-1.5">
-                  <span className="flex items-center gap-0.5 font-semibold text-left">
-                    <span className="text-indigo-700 font-bold">🛠️ Limit sandbox:</span> 
-                    {isPremiumUser ? "Active unlimited scans" : `Complimentary free scans left: ${dailyScansLeft}`}
-                  </span>
-                  <div className="flex items-center gap-1">
+                <div className="bg-slate-100/70 border border-slate-200/60 rounded-lg p-2.5 flex flex-col gap-2 text-[10px] text-slate-500 mb-1.5">
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <span className="font-semibold text-slate-700 flex items-center gap-1">🛠️ Reviewer Subscription Sandbox:</span>
+                    <span className="font-mono text-slate-600">Active: <span className="font-bold text-pink-600">{subscription.planType.toUpperCase()}</span> (Today scans: {subscription.scanCountToday})</span>
+                  </div>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
                     <button
                       type="button"
                       onClick={() => {
-                        setDailyScansLeft(0);
-                        setIsPremiumUser(false);
+                        setSubscription({
+                          planType: 'free',
+                          startDate: null,
+                          endDate: null,
+                          selectedDays: [],
+                          daysUsed: [],
+                          scanCountToday: 2,
+                          lastResetDate: getCurrentLocalDateString(),
+                          freeTotalScansUsed: 3
+                        });
                       }}
-                      className="bg-red-50 hover:bg-red-100 text-red-700 font-black px-1.5 py-0.5 rounded border border-red-100 transition-all cursor-pointer active:scale-95 text-[9px]"
-                      title="Set remainder scans to zero to test daily limit lock"
+                      className="bg-red-50 hover:bg-red-100 text-red-700 font-bold p-1 rounded border border-red-100 transition-all cursor-pointer text-center text-[9px]"
+                      title="Exhaust Free Scan Daily Limit"
                     >
-                      Simulate Limit Exhaustion
+                      Exhaust Free (2/2 Used)
                     </button>
                     <button
                       type="button"
                       onClick={() => {
-                        setDailyScansLeft(3);
-                        setIsPremiumUser(false);
+                        setSubscription({
+                          planType: 'weekly',
+                          startDate: new Date().toISOString(),
+                          endDate: new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString(),
+                          selectedDays: ["Monday", "Wednesday", "Friday"], // standard selected days
+                          daysUsed: [],
+                          scanCountToday: 0,
+                          lastResetDate: getCurrentLocalDateString(),
+                          freeTotalScansUsed: subscription.freeTotalScansUsed
+                        });
                       }}
-                      className="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-black px-1.5 py-0.5 rounded border border-indigo-100 transition-all cursor-pointer active:scale-95 text-[9px]"
-                      title="Reset standard quota"
+                      className="bg-pink-50 hover:bg-pink-100 text-[#FF6FA7] font-bold p-1 rounded border border-pink-100 transition-all cursor-pointer text-center text-[9px]"
+                      title="Switch to Weekly Plan (M, W, F selected)"
                     >
-                      Reset (3 Left)
+                      Set Weekly (M/W/F)
                     </button>
                     <button
                       type="button"
                       onClick={() => {
-                        setIsPremiumUser(true);
+                        setSubscription({
+                          planType: 'monthly',
+                          startDate: new Date().toISOString(),
+                          endDate: new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString(),
+                          selectedDays: [],
+                          daysUsed: [],
+                          scanCountToday: 4,
+                          lastResetDate: getCurrentLocalDateString(),
+                          freeTotalScansUsed: subscription.freeTotalScansUsed
+                        });
                       }}
-                      className="bg-purple-100 hover:bg-purple-200 text-purple-705 font-black px-1.5 py-0.5 rounded border border-purple-205 transition-all cursor-pointer active:scale-95 text-[9px]"
-                      title="Set subscription status to active"
+                      className="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-bold p-1 rounded border border-indigo-100 transition-all cursor-pointer text-center text-[9px]"
+                      title="Switch to Monthly Plan"
                     >
-                      Activate Pro Free
+                      Set Monthly (4/5 Used)
                     </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSubscription({
+                          planType: 'premium',
+                          startDate: new Date().toISOString(),
+                          endDate: new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString(),
+                          selectedDays: [],
+                          daysUsed: [],
+                          scanCountToday: 0,
+                          lastResetDate: getCurrentLocalDateString(),
+                          freeTotalScansUsed: subscription.freeTotalScansUsed
+                        });
+                      }}
+                      className="bg-purple-100 hover:bg-purple-200 text-purple-700 font-bold p-1 rounded border border-purple-200 transition-all cursor-pointer text-center text-[9px]"
+                      title="Switch to Premium Plan"
+                    >
+                      Set Premium Active
+                    </button>
+                  </div>
+                  <div className="flex justify-between items-center text-[9px] text-slate-400 border-t border-slate-200/50 pt-1.5 mt-0.5">
+                    <span>*Weekly Selected: {subscription.selectedDays.join(', ') || 'None'}</span>
+                    <span>Days Used: {subscription.daysUsed.length}/3 ({subscription.daysUsed.join(', ') || 'None'})</span>
                   </div>
                 </div>
 
@@ -2280,7 +2641,16 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => {
-                          setDailyScansLeft(3);
+                          setSubscription({
+                            planType: 'free',
+                            startDate: null,
+                            endDate: null,
+                            selectedDays: [],
+                            daysUsed: [],
+                            scanCountToday: 0,
+                            lastResetDate: getCurrentLocalDateString(),
+                            freeTotalScansUsed: 0
+                          });
                           setAnalysisError(null);
                         }}
                         className="text-[9.5px] bg-slate-800 hover:bg-slate-750 border border-slate-700/60 text-slate-300 font-bold py-1 px-3 rounded-lg transition-all cursor-pointer active:scale-95"
@@ -2485,7 +2855,7 @@ export default function App() {
                               {!analysisResult.isCakeDetected && inputs.cakeSize === '' && (
                                 <button
                                   type="button"
-                                  onClick={applyStandardEstimate}
+                                  onClick={calculateCakePrice}
                                   className="w-full bg-amber-600 hover:bg-amber-700 text-white font-semibold text-xs py-2 px-3 rounded-lg transition-all shadow-xs flex items-center justify-center gap-1.5 cursor-pointer"
                                 >
                                   <span>Confirm Standard Fallback (8&quot; / 2 layers)</span>
@@ -2720,7 +3090,15 @@ export default function App() {
               <div className="absolute top-0 right-0 w-24 h-24 bg-emerald-500/10 rounded-full blur-xl -mr-6 -mt-6"></div>
               
               <div className="space-y-1 relative z-10">
-                <span className="text-[10px] uppercase font-extrabold tracking-widest text-emerald-400 block">Quick Specs Summary</span>
+                <span className="text-[10px] uppercase font-extrabold tracking-widest text-emerald-400 block flex items-center gap-1.5">
+                  <span>Quick Specs Summary</span>
+                  {!isEmpty && (
+                    <span className="inline-flex items-center gap-1 bg-emerald-900/40 text-emerald-300 border border-emerald-800/40 px-1.5 py-0.5 rounded text-[8px] tracking-normal uppercase font-black">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                      Auto-calculating
+                    </span>
+                  )}
+                </span>
                 {isEmpty ? (
                   <p className="text-sm font-bold flex items-center gap-1.5 flex-wrap text-slate-300">
                     <span>🎂 Empty Setup</span>
@@ -2759,17 +3137,39 @@ export default function App() {
                   <Sparkles className="w-8 h-8 text-emerald-600" />
                 </div>
                 <div className="space-y-2 max-w-sm">
-                  <h3 className="text-lg font-bold text-slate-800">Start a new cake analysis</h3>
+                  <h3 className="text-lg font-bold text-slate-800">Complete cake details to see price</h3>
                   <p className="text-xs text-slate-500 leading-relaxed">
-                    Upload a reference cake photo to automatically analyze sizes, layers, and complexity using CakeWise-AI, or configure your dimensions on the left manually to see pricing instantly.
+                    Configure your cake dimensions on the left manually (size, layers, and tiers) or upload a reference photo for Cakewise-AI to auto-extract the specifications.
                   </p>
                 </div>
+
+                {(() => {
+                  const missing = getMissingFields(inputs);
+                  if (missing.length > 0) {
+                    return (
+                      <div className="bg-amber-50/50 border border-amber-200/50 rounded-xl p-3 max-w-xs text-left text-xs text-amber-800 space-y-1.5">
+                        <p className="font-extrabold flex items-center gap-1 text-amber-805">
+                          <span>⚠️</span> Missing required details:
+                        </p>
+                        <div className="flex flex-wrap gap-1 mt-1">
+                          {missing.map((f, idx) => (
+                            <span key={idx} className="bg-amber-100 text-amber-900 font-bold px-2 py-0.5 rounded text-[10px]">
+                              {f}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  }
+                  return null;
+                })()}
 
                 <div className="w-full max-w-xs border-t border-slate-100 my-1 pt-4 flex flex-col gap-2">
                   <button
                     type="button"
-                    onClick={applyStandardEstimate}
+                    onClick={calculateCakePrice}
                     className="w-full bg-emerald-650 hover:bg-emerald-700 bg-emerald-600 text-white font-semibold text-xs py-2.5 px-4 rounded-xl transition-all shadow-xs flex items-center justify-center gap-1.5 active:scale-95 cursor-pointer font-sans"
+                    id="calculate_cake_price_btn"
                   >
                     <span>⚡ Use Standard Estimate</span>
                   </button>
@@ -3802,8 +4202,16 @@ export default function App() {
                             onClick={(e) => {
                               e.stopPropagation();
                               setSelectedPlanTab('free');
-                              setIsPremiumUser(false);
-                              setDailyScansLeft(3);
+                              setSubscription({
+                                planType: 'free',
+                                startDate: null,
+                                endDate: null,
+                                selectedDays: [],
+                                daysUsed: [],
+                                scanCountToday: 0,
+                                lastResetDate: getCurrentLocalDateString(),
+                                freeTotalScansUsed: 0
+                              });
                               setShowPricingModal(false);
                             }}
                             className={`w-full text-center text-xs font-black py-3 px-4 rounded-xl transition-all cursor-pointer ${
